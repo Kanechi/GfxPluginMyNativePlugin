@@ -16,10 +16,25 @@ static VkDevice s_device = VK_NULL_HANDLE;
 static VkPipelineLayout s_pipelineLayout = VK_NULL_HANDLE;
 static VkPipeline s_pipeline = VK_NULL_HANDLE;
 static VkRenderPass s_cachedRenderPass = VK_NULL_HANDLE;
-static int s_cachedSubpassIndex = -1;
 
+static int s_cachedSubpassIndex = -1;
 static int s_width = 1;
 static int s_height = 1;
+
+static void* s_sourceTexture = nullptr;
+static VkDescriptorSetLayout s_descSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool s_descPool = VK_NULL_HANDLE;
+static VkDescriptorSet s_descSet = VK_NULL_HANDLE;
+static VkSampler s_sampler = VK_NULL_HANDLE;
+
+static VkImageView s_sourceImageView = VK_NULL_HANDLE;
+static VkImage s_lastSourceImage = VK_NULL_HANDLE;
+
+struct PushConstants
+{
+	float color[4];
+};
+static PushConstants s_pushConstants = { 1.0f, 0.0f, 0.0f, 1.0f };
 
 static std::vector<char> ReadBinaryFile(const char* path)
 {
@@ -51,6 +66,91 @@ static VkShaderModule CreateShaderModule(VkDevice device, const char* path)
 	return module;
 }
 
+static void DestroyDescriptorObjects()
+{
+	if (s_sampler != VK_NULL_HANDLE) 
+	{
+		vkDestroySampler(s_device, s_sampler, nullptr);
+		s_sampler = VK_NULL_HANDLE;
+	}
+
+	if (s_descPool != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorPool(s_device, s_descPool, nullptr);
+		s_descPool = VK_NULL_HANDLE;
+	}
+
+	if (s_descSetLayout != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorSetLayout(s_device, s_descSetLayout, nullptr);
+		s_descSetLayout = VK_NULL_HANDLE;
+	}
+
+	s_descSet = VK_NULL_HANDLE;
+
+	if (s_sourceImageView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(s_device, s_sourceImageView, nullptr);
+		s_sourceImageView = VK_NULL_HANDLE;
+	}
+
+	s_lastSourceImage = VK_NULL_HANDLE;
+}
+
+static bool CreateDescriptorObjects()
+{
+	VkDescriptorSetLayoutBinding binding{};
+	binding.binding = 0;
+	binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	binding.descriptorCount = 1;
+	binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo{};
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 1;
+	layoutInfo.pBindings = &binding;
+
+	if (vkCreateDescriptorSetLayout(s_device, &layoutInfo, nullptr, &s_descSetLayout))
+		return false;
+
+	VkDescriptorPoolSize poolSize{};
+	poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	poolSize.descriptorCount = 1;
+
+	VkDescriptorPoolCreateInfo poolInfo{};
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes = &poolSize;
+
+	if (vkCreateDescriptorPool(s_device, &poolInfo, nullptr, &s_descPool) != VK_SUCCESS)
+		return false;
+
+	VkDescriptorSetAllocateInfo allocInfo{};
+	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocInfo.descriptorPool = s_descPool;
+	allocInfo.descriptorSetCount = 1;
+	allocInfo.pSetLayouts = &s_descSetLayout;
+
+	if (vkAllocateDescriptorSets(s_device, &allocInfo, &s_descSet) != VK_SUCCESS)
+		return false;
+
+	VkSamplerCreateInfo samplerInfo{};
+	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerInfo.magFilter = VK_FILTER_LINEAR;
+	samplerInfo.minFilter = VK_FILTER_LINEAR;
+	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.maxLod = 1.0f;
+
+	if (vkCreateSampler(s_device, &samplerInfo, nullptr, &s_sampler) != VK_SUCCESS)
+		return false;
+
+	return true;
+}
+
 static void DestroyPipelineObjects()
 {
 	if (s_pipeline != VK_NULL_HANDLE)
@@ -66,6 +166,7 @@ static void DestroyPipelineObjects()
 	}
 
 	s_cachedRenderPass = VK_NULL_HANDLE;
+	s_cachedSubpassIndex = -1;
 }
 
 static bool CreatePipelineForRenderPass(VkDevice device, VkRenderPass renderPass, int subpassIndex)
@@ -145,8 +246,11 @@ static bool CreatePipelineForRenderPass(VkDevice device, VkRenderPass renderPass
 	ds.dynamicStateCount = 2;
 	ds.pDynamicStates = dynamics;
 
+
 	VkPipelineLayoutCreateInfo pl{};
 	pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pl.setLayoutCount = 1;
+	pl.pSetLayouts = &s_descSetLayout;
 
 	if (vkCreatePipelineLayout(device, &pl, nullptr, &s_pipelineLayout) != VK_SUCCESS)
 	{
@@ -183,6 +287,7 @@ static bool CreatePipelineForRenderPass(VkDevice device, VkRenderPass renderPass
 	}
 
 	s_cachedRenderPass = renderPass;
+	s_cachedSubpassIndex = subpassIndex;
 	return true;
 }
 
@@ -201,6 +306,9 @@ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType ev
 		UnityVulkanInstance instance = s_vulkan->Instance();
 		s_device = instance.device;
 
+		DestroyDescriptorObjects();
+		CreateDescriptorObjects();
+
 	}
 	else if (eventType == kUnityGfxDeviceEventShutdown)
 	{
@@ -208,6 +316,8 @@ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType ev
 		if (s_device != VK_NULL_HANDLE)
 			DestroyPipelineObjects();
 #endif
+		DestroyDescriptorObjects();
+
 		s_device = VK_NULL_HANDLE;
 		s_vulkan = nullptr;
 	}
@@ -228,6 +338,45 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 
 	if (state.renderPass == VK_NULL_HANDLE)
 		return;
+
+	if (state.subPassIndex < 0)
+		return;
+
+	if (s_sourceTexture == nullptr)
+		return;
+
+	UnityVulkanImage image{};
+	if (!s_vulkan->AccessTexture(
+		s_sourceTexture,
+		UnityVulkanWholeImage,
+		VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_ACCESS_SHADER_READ_BIT,
+		kUnityVulkanResourceAccess_PipelineBarrier,
+		&image)) {
+		return;
+	}
+
+	if (image.image == VK_NULL_HANDLE)
+		return;
+
+	if (s_lastSourceImage != image.image || s_sourceImageView == VK_NULL_HANDLE)
+	{
+	}
+
+	VkDescriptorImageInfo imageInfo{};
+
+	VkWriteDescriptorSet write{};
+	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	write.dstSet = s_descSet;
+	write.dstBinding = 0;
+	write.dstArrayElement = 0;
+	write.descriptorCount = 1;
+	write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	write.pImageInfo = &imageInfo;
+
+	vkUpdateDescriptorSets(s_device, 1, &write, 0, nullptr);
+
 
 	if (state.renderPass != s_cachedRenderPass || 
 		state.subPassIndex != s_cachedSubpassIndex ||
@@ -250,6 +399,13 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	scissor.extent = { (uint32_t)s_width, (uint32_t)s_height };
 	
 	vkCmdBindPipeline(state.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+	vkCmdBindDescriptorSets(
+		state.commandBuffer,
+		VK_PIPELINE_BIND_POINT_GRAPHICS,
+		s_pipelineLayout,
+		0, 1, &s_descSet, 0, nullptr
+	);
+	
 	vkCmdSetViewport(state.commandBuffer, 0, 1, &viewport);
 	vkCmdSetScissor(state.commandBuffer, 0, 1, &scissor);
 	vkCmdDraw(state.commandBuffer, 3, 1, 0, 0);
@@ -276,6 +432,8 @@ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginLoad(IUnit
 
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginUnload()
 {
+	DestroyDescriptorObjects();
+
 	if (s_graphics)
 		s_graphics->UnregisterDeviceEventCallback(OnGraphicsDeviceEvent);
 
@@ -292,4 +450,17 @@ extern "C" __declspec(dllexport) void SetRenderSize(int width, int height)
 {
 	s_width = width;
 	s_height = height;
+}
+
+extern "C" __declspec(dllexport) void SetColor(float r, float g, float b, float a)
+{
+	s_pushConstants.color[0] = r;
+	s_pushConstants.color[1] = g;
+	s_pushConstants.color[2] = b;
+	s_pushConstants.color[3] = a;
+}
+
+extern "C" __declspec(dllexport) void SetSourceTexture(void* nativeTex)
+{
+	s_sourceTexture = nativeTex;
 }
