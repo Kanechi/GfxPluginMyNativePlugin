@@ -30,11 +30,20 @@ static VkSampler s_sampler = VK_NULL_HANDLE;
 static VkImageView s_sourceImageView = VK_NULL_HANDLE;
 static VkImage s_lastSourceImage = VK_NULL_HANDLE;
 
+#if false
 struct PushConstants
 {
 	float color[4];
 };
 static PushConstants s_pushConstants = { 1.0f, 0.0f, 0.0f, 1.0f };
+#endif
+
+static int s_debugStatus = 0;
+
+extern "C" __declspec(dllexport) int GetDebugStatus()
+{
+	return s_debugStatus;
+}
 
 static std::vector<char> ReadBinaryFile(const char* path)
 {
@@ -68,6 +77,14 @@ static VkShaderModule CreateShaderModule(VkDevice device, const char* path)
 
 static void DestroyDescriptorObjects()
 {
+	if (s_sourceImageView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(s_device, s_sourceImageView, nullptr);
+		s_sourceImageView = VK_NULL_HANDLE;
+	}
+
+	s_lastSourceImage = VK_NULL_HANDLE;
+
 	if (s_sampler != VK_NULL_HANDLE) 
 	{
 		vkDestroySampler(s_device, s_sampler, nullptr);
@@ -88,13 +105,7 @@ static void DestroyDescriptorObjects()
 
 	s_descSet = VK_NULL_HANDLE;
 
-	if (s_sourceImageView != VK_NULL_HANDLE)
-	{
-		vkDestroyImageView(s_device, s_sourceImageView, nullptr);
-		s_sourceImageView = VK_NULL_HANDLE;
-	}
 
-	s_lastSourceImage = VK_NULL_HANDLE;
 }
 
 static bool CreateDescriptorObjects()
@@ -110,7 +121,7 @@ static bool CreateDescriptorObjects()
 	layoutInfo.bindingCount = 1;
 	layoutInfo.pBindings = &binding;
 
-	if (vkCreateDescriptorSetLayout(s_device, &layoutInfo, nullptr, &s_descSetLayout))
+	if (vkCreateDescriptorSetLayout(s_device, &layoutInfo, nullptr, &s_descSetLayout) != VK_SUCCESS)
 		return false;
 
 	VkDescriptorPoolSize poolSize{};
@@ -307,43 +318,67 @@ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType ev
 		s_device = instance.device;
 
 		DestroyDescriptorObjects();
-		CreateDescriptorObjects();
+		if (!CreateDescriptorObjects()) 
+		{
+			DestroyDescriptorObjects();
+			return;
+		}
 
 	}
 	else if (eventType == kUnityGfxDeviceEventShutdown)
 	{
-#if 0
-		if (s_device != VK_NULL_HANDLE)
-			DestroyPipelineObjects();
-#endif
 		DestroyDescriptorObjects();
-
 		s_device = VK_NULL_HANDLE;
 		s_vulkan = nullptr;
 	}
 }
 
+
+
 static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 {
+	s_debugStatus = 1;
 
 	if (eventId != 1 || !s_vulkan || s_device == VK_NULL_HANDLE)
+	{
+		s_debugStatus = -1;
 		return;
+	}
 
 	UnityVulkanRecordingState state{};
 	if (!s_vulkan->CommandRecordingState(&state, kUnityVulkanGraphicsQueueAccess_DontCare))
+	{
+		s_debugStatus = -2;
 		return;
+	}
+
+	s_debugStatus = 2;
 
 	if (state.commandBuffer == VK_NULL_HANDLE)
+	{
+		s_debugStatus = -3;
 		return;
+	}
 
 	if (state.renderPass == VK_NULL_HANDLE)
+	{
+		s_debugStatus = -4;
 		return;
+	}
 
 	if (state.subPassIndex < 0)
+	{
+		s_debugStatus = -5;
 		return;
+	}
 
 	if (s_sourceTexture == nullptr)
+	{
+		s_debugStatus = -6;
 		return;
+	}
+
+	s_debugStatus = 3;
 
 	UnityVulkanImage image{};
 	if (!s_vulkan->AccessTexture(
@@ -353,18 +388,54 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		VK_ACCESS_SHADER_READ_BIT,
 		kUnityVulkanResourceAccess_PipelineBarrier,
-		&image)) {
+		&image))
+	{
+		s_debugStatus = -7;
 		return;
 	}
 
 	if (image.image == VK_NULL_HANDLE)
+	{
+		s_debugStatus = -8;
 		return;
+	}
+
+	s_debugStatus = 4;
 
 	if (s_lastSourceImage != image.image || s_sourceImageView == VK_NULL_HANDLE)
 	{
+		if (s_sourceImageView != VK_NULL_HANDLE)
+		{
+			vkDestroyImageView(s_device, s_sourceImageView, nullptr);
+			s_sourceImageView = VK_NULL_HANDLE;
+		}
+
+		VkImageViewCreateInfo iv{};
+		iv.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		iv.image = image.image;
+		iv.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		iv.format = image.format;
+		iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		iv.subresourceRange.baseMipLevel = 0;
+		iv.subresourceRange.levelCount = 1;
+		iv.subresourceRange.baseArrayLayer = 0;
+		iv.subresourceRange.layerCount = 1;
+
+		if (vkCreateImageView(s_device, &iv, nullptr, &s_sourceImageView) != VK_SUCCESS)
+		{
+			s_debugStatus = -9;
+			return;
+		}
+
+		s_lastSourceImage = image.image;
 	}
 
+	s_debugStatus = 5;
+
 	VkDescriptorImageInfo imageInfo{};
+	imageInfo.sampler = s_sampler;
+	imageInfo.imageView = s_sourceImageView;
+	imageInfo.imageLayout = image.layout;
 
 	VkWriteDescriptorSet write{};
 	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -377,14 +448,20 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 
 	vkUpdateDescriptorSets(s_device, 1, &write, 0, nullptr);
 
+	s_debugStatus = 6;
 
-	if (state.renderPass != s_cachedRenderPass || 
+	if (state.renderPass != s_cachedRenderPass ||
 		state.subPassIndex != s_cachedSubpassIndex ||
 		s_pipeline == VK_NULL_HANDLE)
 	{
 		if (!CreatePipelineForRenderPass(s_device, state.renderPass, state.subPassIndex))
+		{
+			s_debugStatus = -10;
 			return;
+		}
 	}
+
+	s_debugStatus = 7;
 
 	VkViewport viewport{};
 	viewport.x = 0.0f;
@@ -397,18 +474,24 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	VkRect2D scissor{};
 	scissor.offset = { 0, 0 };
 	scissor.extent = { (uint32_t)s_width, (uint32_t)s_height };
-	
+
 	vkCmdBindPipeline(state.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipeline);
+
 	vkCmdBindDescriptorSets(
 		state.commandBuffer,
 		VK_PIPELINE_BIND_POINT_GRAPHICS,
 		s_pipelineLayout,
-		0, 1, &s_descSet, 0, nullptr
-	);
-	
+		0,
+		1,
+		&s_descSet,
+		0,
+		nullptr);
+
 	vkCmdSetViewport(state.commandBuffer, 0, 1, &viewport);
 	vkCmdSetScissor(state.commandBuffer, 0, 1, &scissor);
 	vkCmdDraw(state.commandBuffer, 3, 1, 0, 0);
+
+	s_debugStatus = 8;
 }
 
 extern "C" UnityRenderingEvent UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetRenderEventFunc()
@@ -424,9 +507,6 @@ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginLoad(IUnit
 	if (s_graphics)
 	{
 		s_graphics->RegisterDeviceEventCallback(OnGraphicsDeviceEvent);
-#if 0
-		OnGraphicsDeviceEvent(kUnityGfxDeviceEventInitialize);
-#endif
 	}
 }
 
@@ -452,15 +532,8 @@ extern "C" __declspec(dllexport) void SetRenderSize(int width, int height)
 	s_height = height;
 }
 
-extern "C" __declspec(dllexport) void SetColor(float r, float g, float b, float a)
-{
-	s_pushConstants.color[0] = r;
-	s_pushConstants.color[1] = g;
-	s_pushConstants.color[2] = b;
-	s_pushConstants.color[3] = a;
-}
-
 extern "C" __declspec(dllexport) void SetSourceTexture(void* nativeTex)
 {
 	s_sourceTexture = nativeTex;
 }
+
