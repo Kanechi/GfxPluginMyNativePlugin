@@ -40,6 +40,16 @@ static VkFramebuffer s_offscreenFramebuffer = VK_NULL_HANDLE;
 static VkPipelineLayout s_offscreenPipelineLayout = VK_NULL_HANDLE;
 static VkPipeline s_offscreenPipeline = VK_NULL_HANDLE;
 
+static void* s_blurTexture = nullptr;
+
+static VkImageView s_blurImageView = VK_NULL_HANDLE;
+static VkImage s_lastBlurImage = VK_NULL_HANDLE;
+
+static VkRenderPass s_blurRenderPass = VK_NULL_HANDLE;
+static VkFramebuffer s_blurFramebuffer = VK_NULL_HANDLE;
+static VkPipelineLayout s_blurPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline s_blurPipeline = VK_NULL_HANDLE;
+
 static std::vector<char> ReadBinaryFile(const char* path)
 {
 	std::ifstream ifs(path, std::ios::binary | std::ios::ate);
@@ -290,6 +300,38 @@ static bool CreatePipelineForRenderPass(VkDevice device, VkRenderPass renderPass
 
 static void DestroyOffscreenObjects()
 {
+	if (s_blurFramebuffer != VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(s_device, s_blurFramebuffer, nullptr);
+		s_blurFramebuffer = VK_NULL_HANDLE;
+	}
+
+	if (s_blurPipeline != VK_NULL_HANDLE)
+	{
+		vkDestroyPipeline(s_device, s_blurPipeline, nullptr);
+		s_blurPipeline = VK_NULL_HANDLE;
+	}
+
+	if (s_blurPipelineLayout != VK_NULL_HANDLE)
+	{
+		vkDestroyPipelineLayout(s_device, s_blurPipelineLayout, nullptr);
+		s_blurPipelineLayout = VK_NULL_HANDLE;
+	}
+
+	if (s_blurRenderPass != VK_NULL_HANDLE)
+	{
+		vkDestroyRenderPass(s_device, s_blurRenderPass, nullptr);
+		s_blurRenderPass = VK_NULL_HANDLE;
+	}
+
+	if (s_blurImageView != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(s_device, s_blurImageView, nullptr);
+		s_blurImageView = VK_NULL_HANDLE;
+	}
+	s_lastBlurImage = VK_NULL_HANDLE;
+
+
 	if (s_offscreenFramebuffer != VK_NULL_HANDLE)
 	{
 		vkDestroyFramebuffer(s_device, s_offscreenFramebuffer, nullptr);
@@ -327,6 +369,179 @@ static void DestroyOffscreenObjects()
 		s_bloomImageView = VK_NULL_HANDLE;
 	}
 	s_lastBloomImage = VK_NULL_HANDLE;
+}
+
+static bool CreateBlurRenderPass(VkFormat colorFormat)
+{
+	if (s_blurRenderPass != VK_NULL_HANDLE)
+		return true;
+
+	VkAttachmentDescription colorAttachment{};
+	colorAttachment.format = colorFormat;
+	colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	VkAttachmentReference colorRef{};
+	colorRef.attachment = 0;
+	colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkSubpassDescription subpass{};
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorRef;
+
+	VkRenderPassCreateInfo rp{};
+	rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	rp.attachmentCount = 1;
+	rp.pAttachments = &colorAttachment;
+	rp.subpassCount = 1;
+	rp.pSubpasses = &subpass;
+
+	return vkCreateRenderPass(s_device, &rp, nullptr, &s_blurRenderPass) == VK_SUCCESS;
+}
+
+static bool CreateBlurFramebuffer(uint32_t width, uint32_t height)
+{
+	if (s_blurFramebuffer != VK_NULL_HANDLE)
+	{
+		vkDestroyFramebuffer(s_device, s_blurFramebuffer, nullptr);
+		s_blurFramebuffer = VK_NULL_HANDLE;
+	}
+
+	VkImageView attachments[] = { s_blurImageView };
+
+	VkFramebufferCreateInfo fb{};
+	fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	fb.renderPass = s_blurRenderPass;
+	fb.attachmentCount = 1;
+	fb.pAttachments = attachments;
+	fb.width = width;
+	fb.height = height;
+	fb.layers = 1;
+
+	return vkCreateFramebuffer(s_device, &fb, nullptr, &s_blurFramebuffer) == VK_SUCCESS;
+}
+
+static bool CreateBlurPipeline()
+{
+	if (s_blurPipeline != VK_NULL_HANDLE)
+		return true;
+
+	VkShaderModule vert = CreateShaderModule(s_device, "Assets/Plugins/x86_64/fullscreen_vs.spv");
+	VkShaderModule frag = CreateShaderModule(s_device, "Assets/Plugins/x86_64/blur_h_fs.spv");
+	if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE)
+	{
+		if (vert) vkDestroyShaderModule(s_device, vert, nullptr);
+		if (frag) vkDestroyShaderModule(s_device, frag, nullptr);
+		return false;
+	}
+
+	VkPipelineShaderStageCreateInfo stages[2]{};
+	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = vert;
+	stages[0].pName = "main";
+
+	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = frag;
+	stages[1].pName = "main";
+
+	VkPipelineVertexInputStateCreateInfo vi{};
+	vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+	VkPipelineInputAssemblyStateCreateInfo ia{};
+	ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	VkPipelineViewportStateCreateInfo vp{};
+	vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	vp.viewportCount = 1;
+	vp.scissorCount = 1;
+
+	VkPipelineRasterizationStateCreateInfo rs{};
+	rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	rs.polygonMode = VK_POLYGON_MODE_FILL;
+	rs.cullMode = VK_CULL_MODE_NONE;
+	rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	rs.lineWidth = 1.0f;
+
+	VkPipelineMultisampleStateCreateInfo ms{};
+	ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	VkPipelineColorBlendAttachmentState cbAttachment{};
+	cbAttachment.colorWriteMask =
+		VK_COLOR_COMPONENT_R_BIT |
+		VK_COLOR_COMPONENT_G_BIT |
+		VK_COLOR_COMPONENT_B_BIT |
+		VK_COLOR_COMPONENT_A_BIT;
+	cbAttachment.blendEnable = VK_FALSE;
+
+	VkPipelineColorBlendStateCreateInfo cb{};
+	cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	cb.attachmentCount = 1;
+	cb.pAttachments = &cbAttachment;
+
+	VkDynamicState dynamics[] =
+	{
+		VK_DYNAMIC_STATE_VIEWPORT,
+		VK_DYNAMIC_STATE_SCISSOR
+	};
+
+	VkPipelineDynamicStateCreateInfo ds{};
+	ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	ds.dynamicStateCount = 2;
+	ds.pDynamicStates = dynamics;
+
+	VkPipelineLayoutCreateInfo pl{};
+	pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pl.setLayoutCount = 1;
+	pl.pSetLayouts = &s_descSetLayout;
+
+	if (vkCreatePipelineLayout(s_device, &pl, nullptr, &s_blurPipelineLayout) != VK_SUCCESS)
+	{
+		vkDestroyShaderModule(s_device, vert, nullptr);
+		vkDestroyShaderModule(s_device, frag, nullptr);
+		return false;
+	}
+
+	VkGraphicsPipelineCreateInfo gp{};
+	gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	gp.stageCount = 2;
+	gp.pStages = stages;
+	gp.pVertexInputState = &vi;
+	gp.pInputAssemblyState = &ia;
+	gp.pViewportState = &vp;
+	gp.pRasterizationState = &rs;
+	gp.pMultisampleState = &ms;
+	gp.pColorBlendState = &cb;
+	gp.pDynamicState = &ds;
+	gp.layout = s_blurPipelineLayout;
+	gp.renderPass = s_blurRenderPass;
+	gp.subpass = 0;
+
+	bool ok = (vkCreateGraphicsPipelines(s_device, VK_NULL_HANDLE, 1, &gp, nullptr, &s_blurPipeline) == VK_SUCCESS);
+
+	vkDestroyShaderModule(s_device, vert, nullptr);
+	vkDestroyShaderModule(s_device, frag, nullptr);
+
+	if (!ok)
+	{
+		if (s_blurPipelineLayout != VK_NULL_HANDLE)
+		{
+			vkDestroyPipelineLayout(s_device, s_blurPipelineLayout, nullptr);
+			s_blurPipelineLayout = VK_NULL_HANDLE;
+		}
+		return false;
+	}
+
+	return true;
 }
 
 static bool CreateOffscreenRenderPass(VkFormat colorFormat)
@@ -587,7 +802,7 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	if (eventId != 1 || !s_vulkan || s_device == VK_NULL_HANDLE)
 		return;
 
-	if (s_sourceTexture == nullptr || s_bloomTexture == nullptr)
+	if (s_sourceTexture == nullptr || s_bloomTexture == nullptr || s_blurTexture == nullptr)
 		return;
 
 	// ‚Ü‚¸ Unity ‚ÌŒ»Ý‚Ì render pass ‚ÌŠO‚Öo‚é
@@ -601,7 +816,7 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	if (state.commandBuffer == VK_NULL_HANDLE)
 		return;
 
-	UnityVulkanImage sceneImage{};
+	UnityVulkanImage sourceImage{};
 	if (!s_vulkan->AccessTexture(
 		s_sourceTexture,
 		UnityVulkanWholeImage,
@@ -609,7 +824,7 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		VK_ACCESS_SHADER_READ_BIT,
 		kUnityVulkanResourceAccess_PipelineBarrier,
-		&sceneImage))
+		&sourceImage))
 	{
 		return;
 	}
@@ -627,10 +842,26 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 		return;
 	}
 
-	if (!UpdateImageView(sceneImage, s_lastSourceImage, s_sourceImageView))
+	UnityVulkanImage blurImage{};
+	if (!s_vulkan->AccessTexture(
+		s_blurTexture,
+		UnityVulkanWholeImage,
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		kUnityVulkanResourceAccess_PipelineBarrier,
+		&blurImage))
+	{
+		return;
+	}
+
+	if (!UpdateImageView(sourceImage, s_lastSourceImage, s_sourceImageView))
 		return;
 
 	if (!UpdateImageView(bloomImage, s_lastBloomImage, s_bloomImageView))
+		return;
+
+	if (!UpdateImageView(blurImage, s_lastBlurImage, s_blurImageView))
 		return;
 
 	if (!CreateOffscreenRenderPass(bloomImage.format))
@@ -645,7 +876,7 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	VkDescriptorImageInfo imageInfo{};
 	imageInfo.sampler = s_sampler;
 	imageInfo.imageView = s_sourceImageView;
-	imageInfo.imageLayout = sceneImage.layout;
+	imageInfo.imageLayout = sourceImage.layout;
 
 	VkWriteDescriptorSet write{};
 	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -698,6 +929,76 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 
 	vkCmdSetViewport(state.commandBuffer, 0, 1, &viewport);
 	vkCmdSetScissor(state.commandBuffer, 0, 1, &scissor);
+	vkCmdDraw(state.commandBuffer, 3, 1, 0, 0);
+
+	vkCmdEndRenderPass(state.commandBuffer);
+
+	if (!CreateBlurRenderPass(blurImage.format))
+		return;
+
+	if (!CreateBlurFramebuffer(blurImage.extent.width, blurImage.extent.height))
+		return;
+
+	if (!CreateBlurPipeline())
+		return;
+
+	// “ü—Í‚Í BloomRT
+	VkDescriptorImageInfo blurInputInfo{};
+	blurInputInfo.sampler = s_sampler;
+	blurInputInfo.imageView = s_bloomImageView;
+	blurInputInfo.imageLayout = bloomImage.layout;
+
+	VkWriteDescriptorSet blurWrite{};
+	blurWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	blurWrite.dstSet = s_descSet;
+	blurWrite.dstBinding = 0;
+	blurWrite.dstArrayElement = 0;
+	blurWrite.descriptorCount = 1;
+	blurWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	blurWrite.pImageInfo = &blurInputInfo;
+
+	vkUpdateDescriptorSets(s_device, 1, &blurWrite, 0, nullptr);
+
+	VkClearValue blurClear{};
+	blurClear.color = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+
+	VkRenderPassBeginInfo blurRpBegin{};
+	blurRpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	blurRpBegin.renderPass = s_blurRenderPass;
+	blurRpBegin.framebuffer = s_blurFramebuffer;
+	blurRpBegin.renderArea.offset = { 0, 0 };
+	blurRpBegin.renderArea.extent = { blurImage.extent.width, blurImage.extent.height };
+	blurRpBegin.clearValueCount = 1;
+	blurRpBegin.pClearValues = &blurClear;
+
+	vkCmdBeginRenderPass(state.commandBuffer, &blurRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+	VkViewport blurViewport{};
+	blurViewport.x = 0.0f;
+	blurViewport.y = 0.0f;
+	blurViewport.width = (float)blurImage.extent.width;
+	blurViewport.height = (float)blurImage.extent.height;
+	blurViewport.minDepth = 0.0f;
+	blurViewport.maxDepth = 1.0f;
+
+	VkRect2D blurScissor{};
+	blurScissor.offset = { 0, 0 };
+	blurScissor.extent = { blurImage.extent.width, blurImage.extent.height };
+
+	vkCmdBindPipeline(state.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s_blurPipeline);
+
+	vkCmdBindDescriptorSets(
+		state.commandBuffer,
+		VK_PIPELINE_BIND_POINT_GRAPHICS,
+		s_blurPipelineLayout,
+		0,
+		1,
+		&s_descSet,
+		0,
+		nullptr);
+
+	vkCmdSetViewport(state.commandBuffer, 0, 1, &blurViewport);
+	vkCmdSetScissor(state.commandBuffer, 0, 1, &blurScissor);
 	vkCmdDraw(state.commandBuffer, 3, 1, 0, 0);
 
 	vkCmdEndRenderPass(state.commandBuffer);
@@ -758,3 +1059,7 @@ extern "C" __declspec(dllexport) void SetBloomTexture(void* nativeTex)
 	s_bloomTexture = nativeTex;
 }
 
+extern "C" __declspec(dllexport) void SetBlurTexture(void* nativeTex)
+{
+	s_blurTexture = nativeTex;
+}
