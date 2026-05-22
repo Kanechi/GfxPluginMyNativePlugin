@@ -40,5 +40,14 @@
     <None Include="fullscreen_fs.frag">
       <Filter>リソース ファイル</Filter>
     </None>
+    <None Include="luminance_extraction_fs.frag">
+      <Filter>リソース ファイル</Filter>
+    </None>
+    <None Include="composite_fs.frag">
+      <Filter>リソース ファイル</Filter>
+    </None>
+    <None Include="blur_h_fs.frag">
+      <Filter>リソース ファイル</Filter>
+    </None>
   </ItemGroup>
 </Project>

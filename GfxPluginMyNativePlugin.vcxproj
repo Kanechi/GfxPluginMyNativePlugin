@@ -173,8 +173,11 @@ for %%f in ("$(ProjectDir)*.frag") do (
     <ClCompile Include="PluginMain.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="blur_h_fs.frag" />
+    <None Include="composite_fs.frag" />
     <None Include="fullscreen_fs.frag" />
     <None Include="fullscreen_vs.vert" />
+    <None Include="luminance_extraction_fs.frag" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
