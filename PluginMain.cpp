@@ -50,6 +50,23 @@ static VkFramebuffer s_blurFramebuffer = VK_NULL_HANDLE;
 static VkPipelineLayout s_blurPipelineLayout = VK_NULL_HANDLE;
 static VkPipeline s_blurPipeline = VK_NULL_HANDLE;
 
+static VkDescriptorSetLayout s_compositeDescSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool s_compositeDescPool = VK_NULL_HANDLE;
+static VkDescriptorSet s_compositeDescSet = VK_NULL_HANDLE;
+
+static VkPipelineLayout s_compositePipelineLayout = VK_NULL_HANDLE;
+static VkPipeline s_compositePipeline = VK_NULL_HANDLE;
+static VkRenderPass s_compositeRenderPass = VK_NULL_HANDLE;
+static int s_compositeSubpassIndex = -1;
+
+#if 0
+static int s_debugStatus = 0;
+extern "C" __declspec(dllexport) int GetDebugStatus()
+{
+	return s_debugStatus;
+}
+#endif
+
 static std::vector<char> ReadBinaryFile(const char* path)
 {
 	std::ifstream ifs(path, std::ios::binary | std::ios::ate);
@@ -728,6 +745,211 @@ static bool CreateOffscreenPipeline()
 	return true;
 }
 
+static void DestroyCompositeDescriptorObjects()
+{
+	if (s_compositeDescPool != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorPool(s_device, s_compositeDescPool, nullptr);
+		s_compositeDescPool = VK_NULL_HANDLE;
+	}
+
+	if (s_compositeDescSetLayout != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorSetLayout(s_device, s_compositeDescSetLayout, nullptr);
+		s_compositeDescSetLayout = VK_NULL_HANDLE;
+	}
+
+	s_compositeDescSet = VK_NULL_HANDLE;
+}
+
+static bool CreateCompositeDescriptorObjects()
+{
+	VkDescriptorSetLayoutBinding bindings[2]{};
+
+	bindings[0].binding = 0;
+	bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	bindings[0].descriptorCount = 1;
+	bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	bindings[1].binding = 1;
+	bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	bindings[1].descriptorCount = 1;
+	bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo{};
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 2;
+	layoutInfo.pBindings = bindings;
+
+	if (vkCreateDescriptorSetLayout(s_device, &layoutInfo, nullptr, &s_compositeDescSetLayout) != VK_SUCCESS)
+		return false;
+
+	VkDescriptorPoolSize poolSize{};
+	poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	poolSize.descriptorCount = 2;
+
+	VkDescriptorPoolCreateInfo poolInfo{};
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes = &poolSize;
+
+	if (vkCreateDescriptorPool(s_device, &poolInfo, nullptr, &s_compositeDescPool) != VK_SUCCESS)
+		return false;
+
+	VkDescriptorSetAllocateInfo allocInfo{};
+	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocInfo.descriptorPool = s_compositeDescPool;
+	allocInfo.descriptorSetCount = 1;
+	allocInfo.pSetLayouts = &s_compositeDescSetLayout;
+
+	if (vkAllocateDescriptorSets(s_device, &allocInfo, &s_compositeDescSet) != VK_SUCCESS)
+		return false;
+
+	return true;
+}
+
+static void DestroyCompositePipelineObjects()
+{
+	if (s_compositePipeline != VK_NULL_HANDLE)
+	{
+		vkDestroyPipeline(s_device, s_compositePipeline, nullptr);
+		s_compositePipeline = VK_NULL_HANDLE;
+	}
+
+	if (s_compositePipelineLayout != VK_NULL_HANDLE)
+	{
+		vkDestroyPipelineLayout(s_device, s_compositePipelineLayout, nullptr);
+		s_compositePipelineLayout = VK_NULL_HANDLE;
+	}
+
+	s_compositeRenderPass = VK_NULL_HANDLE;
+	s_compositeSubpassIndex = -1;
+}
+
+static bool CreateCompositePipelineForRenderPass(VkDevice device, VkRenderPass renderPass, int subpassIndex)
+{
+	DestroyCompositePipelineObjects();
+
+	VkShaderModule vert = CreateShaderModule(device, "Assets/Plugins/x86_64/fullscreen_vs.spv");
+	VkShaderModule frag = CreateShaderModule(device, "Assets/Plugins/x86_64/composite_fs.spv");
+	if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE)
+	{
+		if (vert) vkDestroyShaderModule(device, vert, nullptr);
+		if (frag) vkDestroyShaderModule(device, frag, nullptr);
+		return false;
+	}
+
+	VkPipelineShaderStageCreateInfo stages[2]{};
+	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = vert;
+	stages[0].pName = "main";
+
+	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = frag;
+	stages[1].pName = "main";
+
+	VkPipelineVertexInputStateCreateInfo vi{};
+	vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+	VkPipelineInputAssemblyStateCreateInfo ia{};
+	ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	VkPipelineViewportStateCreateInfo vp{};
+	vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	vp.viewportCount = 1;
+	vp.scissorCount = 1;
+
+	VkPipelineRasterizationStateCreateInfo rs{};
+	rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	rs.polygonMode = VK_POLYGON_MODE_FILL;
+	rs.cullMode = VK_CULL_MODE_NONE;
+	rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	rs.lineWidth = 1.0f;
+
+	VkPipelineMultisampleStateCreateInfo ms{};
+	ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	VkPipelineDepthStencilStateCreateInfo dss{};
+	dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	dss.depthTestEnable = VK_FALSE;
+	dss.depthWriteEnable = VK_FALSE;
+	dss.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+	dss.depthBoundsTestEnable = VK_FALSE;
+	dss.stencilTestEnable = VK_FALSE;
+
+	VkPipelineColorBlendAttachmentState cbAttachment{};
+	cbAttachment.colorWriteMask =
+		VK_COLOR_COMPONENT_R_BIT |
+		VK_COLOR_COMPONENT_G_BIT |
+		VK_COLOR_COMPONENT_B_BIT |
+		VK_COLOR_COMPONENT_A_BIT;
+	cbAttachment.blendEnable = VK_FALSE;
+
+	VkPipelineColorBlendStateCreateInfo cb{};
+	cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	cb.attachmentCount = 1;
+	cb.pAttachments = &cbAttachment;
+
+	VkDynamicState dynamics[] =
+	{
+		VK_DYNAMIC_STATE_VIEWPORT,
+		VK_DYNAMIC_STATE_SCISSOR
+	};
+
+	VkPipelineDynamicStateCreateInfo ds{};
+	ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	ds.dynamicStateCount = 2;
+	ds.pDynamicStates = dynamics;
+
+	VkPipelineLayoutCreateInfo pl{};
+	pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pl.setLayoutCount = 1;
+	pl.pSetLayouts = &s_compositeDescSetLayout;
+
+	if (vkCreatePipelineLayout(device, &pl, nullptr, &s_compositePipelineLayout) != VK_SUCCESS)
+	{
+		vkDestroyShaderModule(device, vert, nullptr);
+		vkDestroyShaderModule(device, frag, nullptr);
+		return false;
+	}
+
+	VkGraphicsPipelineCreateInfo gp{};
+	gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	gp.stageCount = 2;
+	gp.pStages = stages;
+	gp.pVertexInputState = &vi;
+	gp.pInputAssemblyState = &ia;
+	gp.pViewportState = &vp;
+	gp.pRasterizationState = &rs;
+	gp.pMultisampleState = &ms;
+	gp.pDepthStencilState = &dss;
+	gp.pColorBlendState = &cb;
+	gp.pDynamicState = &ds;
+	gp.layout = s_compositePipelineLayout;
+	gp.renderPass = renderPass;
+	gp.subpass = subpassIndex;
+
+	bool ok = (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp, nullptr, &s_compositePipeline) == VK_SUCCESS);
+
+	vkDestroyShaderModule(device, vert, nullptr);
+	vkDestroyShaderModule(device, frag, nullptr);
+
+	if (!ok)
+	{
+		DestroyCompositePipelineObjects();
+		return false;
+	}
+
+	s_compositeRenderPass = renderPass;
+	s_compositeSubpassIndex = subpassIndex;
+	return true;
+}
+
 static bool UpdateImageView(
 	UnityVulkanImage& image,
 	VkImage& lastImage,
@@ -785,9 +1007,19 @@ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType ev
 			DestroyDescriptorObjects();
 			return;
 		}
+
+		DestroyCompositeDescriptorObjects();
+		if (!CreateCompositeDescriptorObjects())
+		{
+			DestroyDescriptorObjects();
+			return;
+		}
 	}
 	else if (eventType == kUnityGfxDeviceEventShutdown)
 	{
+		DestroyCompositePipelineObjects();
+		DestroyCompositeDescriptorObjects();
+
 		DestroyOffscreenObjects();
 		DestroyDescriptorObjects();
 
@@ -797,7 +1029,7 @@ static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType ev
 }
 
 // 描画イベント
-static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
+static void UNITY_INTERFACE_API OnRenderEvent_Offscreen(int eventId)
 {
 	if (eventId != 1 || !s_vulkan || s_device == VK_NULL_HANDLE)
 		return;
@@ -805,15 +1037,15 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	if (s_sourceTexture == nullptr || s_bloomTexture == nullptr || s_blurTexture == nullptr)
 		return;
 
-	// まず Unity の現在の render pass の外へ出る
+	// render pass の外へ出る
 	s_vulkan->EnsureOutsideRenderPass();
 
-	// 外枝出た後の recording state を取り直す
-	UnityVulkanRecordingState state{};
-	if (!s_vulkan->CommandRecordingState(&state, kUnityVulkanGraphicsQueueAccess_DontCare))
+	// 外へ出た後の state
+	UnityVulkanRecordingState offscreenState{};
+	if (!s_vulkan->CommandRecordingState(&offscreenState, kUnityVulkanGraphicsQueueAccess_DontCare))
 		return;
 
-	if (state.commandBuffer == VK_NULL_HANDLE)
+	if (offscreenState.commandBuffer == VK_NULL_HANDLE)
 		return;
 
 	UnityVulkanImage sourceImage{};
@@ -864,6 +1096,9 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	if (!UpdateImageView(blurImage, s_lastBlurImage, s_blurImageView))
 		return;
 
+	// ----------------------------------------
+	// 高輝度抽出: SourceRT -> BloomRT
+	// ----------------------------------------
 	if (!CreateOffscreenRenderPass(bloomImage.format))
 		return;
 
@@ -901,7 +1136,7 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	rpBegin.clearValueCount = 1;
 	rpBegin.pClearValues = &clearValue;
 
-	vkCmdBeginRenderPass(state.commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBeginRenderPass(offscreenState.commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
 	VkViewport viewport{};
 	viewport.x = 0.0f;
@@ -915,10 +1150,10 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	scissor.offset = { 0, 0 };
 	scissor.extent = { bloomImage.extent.width, bloomImage.extent.height };
 
-	vkCmdBindPipeline(state.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s_offscreenPipeline);
+	vkCmdBindPipeline(offscreenState.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s_offscreenPipeline);
 
 	vkCmdBindDescriptorSets(
-		state.commandBuffer,
+		offscreenState.commandBuffer,
 		VK_PIPELINE_BIND_POINT_GRAPHICS,
 		s_offscreenPipelineLayout,
 		0,
@@ -927,12 +1162,15 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 		0,
 		nullptr);
 
-	vkCmdSetViewport(state.commandBuffer, 0, 1, &viewport);
-	vkCmdSetScissor(state.commandBuffer, 0, 1, &scissor);
-	vkCmdDraw(state.commandBuffer, 3, 1, 0, 0);
+	vkCmdSetViewport(offscreenState.commandBuffer, 0, 1, &viewport);
+	vkCmdSetScissor(offscreenState.commandBuffer, 0, 1, &scissor);
+	vkCmdDraw(offscreenState.commandBuffer, 3, 1, 0, 0);
 
-	vkCmdEndRenderPass(state.commandBuffer);
+	vkCmdEndRenderPass(offscreenState.commandBuffer);
 
+	// ----------------------------------------
+	// 横ブラー: BloomRT -> BlurRT
+	// ----------------------------------------
 	if (!CreateBlurRenderPass(blurImage.format))
 		return;
 
@@ -942,7 +1180,6 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	if (!CreateBlurPipeline())
 		return;
 
-	// 入力は BloomRT
 	VkDescriptorImageInfo blurInputInfo{};
 	blurInputInfo.sampler = s_sampler;
 	blurInputInfo.imageView = s_bloomImageView;
@@ -971,7 +1208,7 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	blurRpBegin.clearValueCount = 1;
 	blurRpBegin.pClearValues = &blurClear;
 
-	vkCmdBeginRenderPass(state.commandBuffer, &blurRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBeginRenderPass(offscreenState.commandBuffer, &blurRpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
 	VkViewport blurViewport{};
 	blurViewport.x = 0.0f;
@@ -985,10 +1222,10 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 	blurScissor.offset = { 0, 0 };
 	blurScissor.extent = { blurImage.extent.width, blurImage.extent.height };
 
-	vkCmdBindPipeline(state.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s_blurPipeline);
+	vkCmdBindPipeline(offscreenState.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s_blurPipeline);
 
 	vkCmdBindDescriptorSets(
-		state.commandBuffer,
+		offscreenState.commandBuffer,
 		VK_PIPELINE_BIND_POINT_GRAPHICS,
 		s_blurPipelineLayout,
 		0,
@@ -997,17 +1234,153 @@ static void UNITY_INTERFACE_API OnRenderEvent(int eventId)
 		0,
 		nullptr);
 
-	vkCmdSetViewport(state.commandBuffer, 0, 1, &blurViewport);
-	vkCmdSetScissor(state.commandBuffer, 0, 1, &blurScissor);
-	vkCmdDraw(state.commandBuffer, 3, 1, 0, 0);
+	vkCmdSetViewport(offscreenState.commandBuffer, 0, 1, &blurViewport);
+	vkCmdSetScissor(offscreenState.commandBuffer, 0, 1, &blurScissor);
+	vkCmdDraw(offscreenState.commandBuffer, 3, 1, 0, 0);
 
-	vkCmdEndRenderPass(state.commandBuffer);
+	vkCmdEndRenderPass(offscreenState.commandBuffer);
+}
+
+static void UNITY_INTERFACE_API OnRenderEvent_Composite(int eventId)
+{
+	if (eventId != 2 || !s_vulkan || s_device == VK_NULL_HANDLE) {
+		return;
+	}
+
+	if (s_sourceTexture == nullptr || s_blurTexture == nullptr) {
+		return;
+	}
+
+	// ここでは EnsureOutsideRenderPass を呼ばない
+	UnityVulkanRecordingState mainState{};
+	if (!s_vulkan->CommandRecordingState(&mainState, kUnityVulkanGraphicsQueueAccess_DontCare)) {
+		return;
+	}
+
+	if (mainState.commandBuffer == VK_NULL_HANDLE) {
+		return;
+	}
+
+	if (mainState.renderPass == VK_NULL_HANDLE) {
+		return;
+	}
+
+	if (mainState.subPassIndex < 0) {
+		return;
+	}
+
+	UnityVulkanImage sourceImage{};
+	if (!s_vulkan->AccessTexture(
+		s_sourceTexture,
+		UnityVulkanWholeImage,
+		VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_ACCESS_SHADER_READ_BIT,
+		kUnityVulkanResourceAccess_PipelineBarrier,
+		&sourceImage))
+	{
+		return;
+	}
+
+	UnityVulkanImage blurImage{};
+	if (!s_vulkan->AccessTexture(
+		s_blurTexture,
+		UnityVulkanWholeImage,
+		VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_ACCESS_SHADER_READ_BIT,
+		kUnityVulkanResourceAccess_PipelineBarrier,
+		&blurImage))
+	{
+		return;
+	}
+
+	if (!UpdateImageView(sourceImage, s_lastSourceImage, s_sourceImageView)) {
+		return;
+	}
+
+	if (!UpdateImageView(blurImage, s_lastBlurImage, s_blurImageView)) {
+		return;
+	}
+
+	VkDescriptorImageInfo compositeInfos[2]{};
+
+	compositeInfos[0].sampler = s_sampler;
+	compositeInfos[0].imageView = s_sourceImageView;
+	compositeInfos[0].imageLayout = sourceImage.layout;
+
+	compositeInfos[1].sampler = s_sampler;
+	compositeInfos[1].imageView = s_blurImageView;
+	compositeInfos[1].imageLayout = blurImage.layout;
+
+	VkWriteDescriptorSet compositeWrites[2]{};
+
+	compositeWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	compositeWrites[0].dstSet = s_compositeDescSet;
+	compositeWrites[0].dstBinding = 0;
+	compositeWrites[0].dstArrayElement = 0;
+	compositeWrites[0].descriptorCount = 1;
+	compositeWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	compositeWrites[0].pImageInfo = &compositeInfos[0];
+
+	compositeWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	compositeWrites[1].dstSet = s_compositeDescSet;
+	compositeWrites[1].dstBinding = 1;
+	compositeWrites[1].dstArrayElement = 0;
+	compositeWrites[1].descriptorCount = 1;
+	compositeWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	compositeWrites[1].pImageInfo = &compositeInfos[1];
+
+	vkUpdateDescriptorSets(s_device, 2, compositeWrites, 0, nullptr);
+
+	if (mainState.renderPass != s_compositeRenderPass ||
+		mainState.subPassIndex != s_compositeSubpassIndex ||
+		s_compositePipeline == VK_NULL_HANDLE)
+	{
+		if (!CreateCompositePipelineForRenderPass(s_device, mainState.renderPass, mainState.subPassIndex)) 
+		{
+			return;
+		}
+	}
+
+	VkViewport compositeViewport{};
+	compositeViewport.x = 0.0f;
+	compositeViewport.y = 0.0f;
+	compositeViewport.width = (float)s_width;
+	compositeViewport.height = (float)s_height;
+	compositeViewport.minDepth = 0.0f;
+	compositeViewport.maxDepth = 1.0f;
+
+	VkRect2D compositeScissor{};
+	compositeScissor.offset = { 0, 0 };
+	compositeScissor.extent = { (uint32_t)s_width, (uint32_t)s_height };
+
+	vkCmdBindPipeline(mainState.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, s_compositePipeline);
+
+	vkCmdBindDescriptorSets(
+		mainState.commandBuffer,
+		VK_PIPELINE_BIND_POINT_GRAPHICS,
+		s_compositePipelineLayout,
+		0,
+		1,
+		&s_compositeDescSet,
+		0,
+		nullptr);
+
+	vkCmdSetViewport(mainState.commandBuffer, 0, 1, &compositeViewport);
+	vkCmdSetScissor(mainState.commandBuffer, 0, 1, &compositeScissor);
+	vkCmdDraw(mainState.commandBuffer, 3, 1, 0, 0);
 }
 
 // Unity 側に描画イベントの関数ポインタを渡すための関数
-extern "C" UnityRenderingEvent UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetRenderEventFunc()
+extern "C" UnityRenderingEvent UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetOffscreenRenderEventFunc()
 {
-	return OnRenderEvent;
+	return OnRenderEvent_Offscreen;
+}
+
+extern "C" UnityRenderingEvent UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API GetCompositeRenderEventFunc()
+{
+	return OnRenderEvent_Composite;
 }
 
 // Unity の Plugin がロードされたときに呼び出される関数
@@ -1025,6 +1398,9 @@ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginLoad(IUnit
 // Unity の Plugin がアンロードされるときに呼び出される関数
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginUnload()
 {
+	DestroyCompositePipelineObjects();
+	DestroyCompositeDescriptorObjects();
+
 	DestroyOffscreenObjects();
 	DestroyDescriptorObjects();
 
